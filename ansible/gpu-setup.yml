@@ -1,0 +1,123 @@
+---
+- name: Setup NVIDIA GPU on k3s worker (GTX 680 - Kepler)
+  hosts: gpu_nodes
+  become: true
+  vars:
+    nvidia_driver_version: "470"       # Legacy driver for Kepler GPUs like GTX 680
+    nvidia_k8s_plugin_version: "v0.16.2" # Compatible with legacy driver
+    cuda_test_image: "nvidia/cuda:11.4.3-base-ubuntu20.04"  # last CUDA supporting Kepler
+
+  tasks:
+    - name: Ensure apt packages are up to date
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: Install NVIDIA legacy driver for Kepler
+      apt:
+        name: "nvidia-driver-{{ nvidia_driver_version }}"
+        state: present
+
+    - name: Reboot if driver was just installed
+      reboot:
+        msg: "Rebooting to load NVIDIA legacy driver"
+        connect_timeout: 5
+        reboot_timeout: 600
+        pre_reboot_delay: 5
+        post_reboot_delay: 30
+      when: ansible_facts['kernel'] is defined
+
+    - name: Add NVIDIA Docker GPG key
+      apt_key:
+        url: https://nvidia.github.io/nvidia-docker/gpgkey
+        state: present
+
+    - name: Add NVIDIA Docker repository
+      apt_repository:
+        repo: "deb https://nvidia.github.io/libnvidia-container/stable/ubuntu$(lsb_release -rs)/$(ARCH) /"
+        state: present
+      register: repo_added
+      failed_when: false  # handle gracefully in case of arch mismatch
+
+    - name: Install NVIDIA container toolkit
+      apt:
+        name: nvidia-container-toolkit
+        state: present
+        update_cache: yes
+
+    - name: Configure containerd for NVIDIA runtime
+      command: nvidia-ctk runtime configure --runtime=containerd
+      register: ctk_out
+      changed_when: "'already' not in ctk_out.stdout"
+
+    - name: Restart containerd
+      systemd:
+        name: containerd
+        state: restarted
+        enabled: yes
+
+    - name: Deploy NVIDIA device plugin DaemonSet
+      kubernetes.core.k8s:
+        state: present
+        src: "https://raw.githubusercontent.com/NVIDIA/k8s-device-plugin/{{ nvidia_k8s_plugin_version }}/nvidia-device-plugin.yml"
+
+    - name: Verify GPU resource available on node
+      shell: "kubectl describe node $(hostname) | grep -A5 Allocatable"
+      register: gpu_check
+      changed_when: false
+
+    - name: Show GPU allocatable resources
+      debug:
+        var: gpu_check.stdout
+
+    - name: Manual approval before deploying GPU test pod
+      pause:
+        prompt: "Ready to deploy the GPU test pod. Press Enter to continue or Ctrl+C to abort."
+
+    - name: Deploy GPU test pod (CUDA 11.4 for Kepler)
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Pod
+          metadata:
+            name: gpu-test
+          spec:
+            restartPolicy: Never
+            containers:
+            - name: cuda-container
+              image: "{{ cuda_test_image }}"
+              resources:
+                limits:
+                  nvidia.com/gpu: 1
+              command: ["nvidia-smi"]
+
+    - name: Wait for GPU test pod to complete
+      kubernetes.core.k8s_info:
+        kind: Pod
+        namespace: default
+        name: gpu-test
+      register: pod_info
+      until: pod_info.resources[0].status.phase in ["Succeeded", "Failed"]
+      retries: 20
+      delay: 5
+
+    - name: Get logs from GPU test pod
+      shell: "kubectl logs gpu-test"
+      register: test_logs
+      changed_when: false
+
+    - name: Show GPU test pod logs
+      debug:
+        var: test_logs.stdout
+
+    - name: Manual approval before removing GPU test pod
+      pause:
+        prompt: "Ready to remove the GPU test pod. Press Enter to continue or Ctrl+C to abort."
+
+    - name: Remove test pod
+      kubernetes.core.k8s:
+        state: absent
+        kind: Pod
+        namespace: default
+        name: gpu-test
